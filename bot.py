@@ -534,11 +534,7 @@ def clean_config(config: str):
 
 def config_card(number: int, config: str):
     config = clean_config(config)
-
-    return (
-        f"#{number}\n"
-        f"<code>{html.escape(config)}</code>"
-    )
+    return f"#{number}\n{config}"
 
 
 def top_page_keyboard(page: int):
