@@ -536,7 +536,7 @@ def config_card(number: int, config: str):
     config = clean_config(config)
 
     return (
-        f"#{number}\\n"
+        f"#{number}\n"
         f"<code>{html.escape(config)}</code>"
     )
 
