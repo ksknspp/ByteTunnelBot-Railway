@@ -8,3 +8,5 @@ __pycache__/
 *.backup
 *.before_*
 *.broken
+
+*.backup_*
