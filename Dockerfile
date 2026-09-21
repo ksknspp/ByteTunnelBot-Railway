@@ -6,7 +6,12 @@ RUN apt-get update \
        curl \
        jq \
        ca-certificates \
+       ncurses-bin \
     && rm -rf /var/lib/apt/lists/*
+
+# Compatibility for the Termux-specific "pkg install" inside bytetunnel.sh
+RUN printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/pkg \
+    && chmod +x /usr/local/bin/pkg
 
 WORKDIR /app
 
