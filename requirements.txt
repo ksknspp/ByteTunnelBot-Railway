@@ -1,4 +1,1 @@
-python-telegram-bot==22.5
-requests
-httpx
-python-dotenv
+python-telegram-bot==22.8

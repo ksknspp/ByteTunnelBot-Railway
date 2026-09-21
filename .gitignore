@@ -1,12 +1,6 @@
 .env
-.venv/
 __pycache__/
-*.db
 *.pyc
+bytetunnel_bot.db
+backups/
 *.bak
-*.bak_*
-*.backup
-*.before_*
-*.broken
-
-*.backup_*
