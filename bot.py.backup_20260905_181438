@@ -1,0 +1,1267 @@
+import os
+import io
+import re
+import random
+import sqlite3
+import asyncio
+import time
+from datetime import datetime
+
+import httpx
+from dotenv import load_dotenv
+
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
+
+load_dotenv(".env", override=True)
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_IDS = {
+    int(x.strip())
+    for x in os.getenv("ADMIN_IDS", "").split(",")
+    if x.strip().isdigit()
+}
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN داخل .env تنظیم نشده است")
+
+DB = "byte_tunnel.db"
+
+RAW_BASE = (
+    "https://raw.githubusercontent.com/"
+    "0xRadikal/Free-v2ray-Configs/main/"
+)
+
+INDEX_URL = RAW_BASE + "index.json"
+
+DEFAULT_INTERVAL = 900
+DEFAULT_AMOUNT = 10
+
+configs = []
+last_update = None
+update_lock = asyncio.Lock()
+
+
+# =========================================================
+# DATABASE
+# =========================================================
+
+def db():
+    conn = sqlite3.connect(DB)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = db()
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            first_name TEXT,
+            joined_at TEXT
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS proxies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            proxy TEXT UNIQUE,
+            enabled INTEGER DEFAULT 1,
+            added_at TEXT
+        )
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+
+    defaults = {
+        "update_interval": str(DEFAULT_INTERVAL),
+        "amount": str(DEFAULT_AMOUNT),
+    }
+
+    for key, value in defaults.items():
+        conn.execute(
+            "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
+            (key, value)
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def setting(key, default=None):
+    conn = db()
+    row = conn.execute(
+        "SELECT value FROM settings WHERE key=?",
+        (key,)
+    ).fetchone()
+    conn.close()
+
+    return row["value"] if row else default
+
+
+def set_setting(key, value):
+    conn = db()
+    conn.execute(
+        "INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
+        (key, str(value))
+    )
+    conn.commit()
+    conn.close()
+
+
+def save_user(user):
+    if not user:
+        return
+
+    conn = db()
+
+    conn.execute("""
+        INSERT OR REPLACE INTO users
+        (user_id, username, first_name, joined_at)
+        VALUES (?, ?, ?, COALESCE(
+            (SELECT joined_at FROM users WHERE user_id=?),
+            ?
+        ))
+    """, (
+        user.id,
+        user.username or "",
+        user.first_name or "",
+        user.id,
+        datetime.now(__import__('datetime').timezone.utc).isoformat()
+    ))
+
+    conn.commit()
+    conn.close()
+
+
+def user_count():
+    conn = db()
+    n = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    conn.close()
+    return n
+
+
+# =========================================================
+# PROXY MANAGER
+# =========================================================
+
+def get_proxies():
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM proxies WHERE enabled=1 ORDER BY id"
+    ).fetchall()
+    conn.close()
+    return [dict(x) for x in rows]
+
+
+def add_proxy(proxy):
+    conn = db()
+
+    try:
+        conn.execute(
+            "INSERT INTO proxies(proxy,enabled,added_at) VALUES(?,?,?)",
+            (proxy, 1, datetime.now(__import__('datetime').timezone.utc).isoformat())
+        )
+        conn.commit()
+        result = True
+    except sqlite3.IntegrityError:
+        result = False
+
+    conn.close()
+    return result
+
+
+def delete_proxy(proxy_id):
+    conn = db()
+    cur = conn.execute(
+        "DELETE FROM proxies WHERE id=?",
+        (proxy_id,)
+    )
+    conn.commit()
+    ok = cur.rowcount > 0
+    conn.close()
+    return ok
+
+
+def clear_proxies():
+    conn = db()
+    conn.execute("DELETE FROM proxies")
+    conn.commit()
+    conn.close()
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+def is_admin(user_id):
+    return user_id in ADMIN_IDS
+
+
+def extract_configs(text):
+    pattern = re.compile(
+        r"(?:vless|vmess|trojan|ss|ssr|socks5?|http|hysteria2|hy2|tuic)://[^\s<>\"]+",
+        re.IGNORECASE
+    )
+
+    result = []
+
+    for config in pattern.findall(text):
+        config = config.rstrip("),]}>'\"")
+
+        if config not in result:
+            result.append(config)
+
+    return result
+
+
+def protocol_of(config):
+    x = config.lower()
+
+    if x.startswith("vless://"):
+        return "VLESS"
+    if x.startswith("vmess://"):
+        return "VMess"
+    if x.startswith("trojan://"):
+        return "Trojan"
+    if x.startswith("ss://"):
+        return "Shadowsocks"
+    if x.startswith("ssr://"):
+        return "SSR"
+    if x.startswith("hysteria2://") or x.startswith("hy2://"):
+        return "Hysteria2"
+    if x.startswith("tuic://"):
+        return "TUIC"
+    if x.startswith("socks"):
+        return "SOCKS"
+    if x.startswith("http://"):
+        return "HTTP"
+
+    return "Other"
+
+
+async def http_get(url, timeout=30):
+    proxies = get_proxies()
+
+    # اول بدون proxy
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=True
+        ) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            return r.text
+    except Exception as direct_error:
+        last_error = direct_error
+
+    # سپس Proxyهای ذخیره‌شده
+    for item in proxies:
+        proxy = item["proxy"]
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=timeout,
+                follow_redirects=True,
+                proxy=proxy
+            ) as client:
+                r = await client.get(url)
+                r.raise_for_status()
+                print(f"[PROXY OK] {proxy}")
+                return r.text
+        except Exception as e:
+            last_error = e
+            print(f"[PROXY ERROR] {proxy} -> {e}")
+
+    raise last_error
+
+
+# =========================================================
+# CONFIG UPDATE
+# =========================================================
+
+async def update_configs():
+    global configs, last_update
+
+    async with update_lock:
+        try:
+            # از index.json برای پیدا کردن مسیرهای فعلی استفاده می‌کنیم
+            index_text = await http_get(INDEX_URL)
+            index_data = __import__("json").loads(index_text)
+
+            sources = []
+
+            categories = index_data.get(
+                "cascade_categories",
+                {}
+            )
+
+            # verified
+            verified = categories.get("verified", {})
+            verified_files = verified.get("files", {})
+
+            verified_url = verified_files.get("configs_txt")
+
+            if verified_url:
+                sources.append(verified_url)
+            else:
+                sources.append(RAW_BASE + "verified/configs.txt")
+
+            # fallback
+            if not sources:
+                sources.append(RAW_BASE + "verified/configs.txt")
+
+            new_configs = []
+
+            for url in sources:
+                try:
+                    text = await http_get(url)
+                    new_configs.extend(extract_configs(text))
+                except Exception as e:
+                    print(f"[SOURCE ERROR] {url} -> {e}")
+
+            configs = list(dict.fromkeys(new_configs))
+            last_update = time.time()
+
+            print(
+                f"[UPDATE] {len(configs)} configs loaded"
+            )
+
+        except Exception as e:
+            print(f"[UPDATE ERROR] {e}")
+
+
+# =========================================================
+# USER KEYBOARDS
+# =========================================================
+
+def main_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            ["⚡ دریافت کانفیگ", "📦 دریافت همه"],
+            ["🚀 بهترین 100", "🌍 کشورها"],
+            ["🔌 پروتکل‌ها", "📊 آمار"],
+        ],
+        resize_keyboard=True
+    )
+
+
+def admin_keyboard():
+    return ReplyKeyboardMarkup(
+        [
+            ["📊 آمار سیستم", "🔄 آپدیت دستی"],
+            ["📦 دریافت دیتابیس", "🚀 Top 100"],
+            ["🌍 کشورها", "🔌 پروتکل‌ها"],
+            ["🌐 مدیریت Proxy", "⚙️ تنظیمات"],
+            ["📢 ارسال همگانی"],
+            ["🏠 منوی کاربر"],
+        ],
+        resize_keyboard=True
+    )
+
+
+# =========================================================
+# START
+# =========================================================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_user(update.effective_user)
+
+    await update.message.reply_text(
+        "⚡ <b>ByteTunnel</b>\n\n"
+        "به ربات دریافت کانفیگ خوش آمدید.\n\n"
+        "از منوی پایین یک گزینه انتخاب کنید.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_keyboard()
+    )
+
+
+# =========================================================
+# RANDOM CONFIGS
+# =========================================================
+
+async def send_random_configs(update, context):
+    if not configs:
+        await update.message.reply_text(
+            "⏳ هنوز کانفیگی دریافت نشده؛ چند لحظه بعد دوباره امتحان کنید."
+        )
+        return
+
+    amount = int(setting("amount", DEFAULT_AMOUNT))
+    amount = max(1, min(amount, len(configs)))
+
+    selected = random.sample(configs, amount)
+
+    text = (
+        "⚡ <b>ByteTunnel</b>\n\n"
+        f"🟢 موجود: <b>{len(configs)}</b>\n"
+        f"📦 ارسال: <b>{amount}</b>\n\n"
+    )
+
+    for i, config in enumerate(selected, 1):
+        text += f"<b>#{i}</b>\n<code>{config}</code>\n\n"
+
+    # برای جلوگیری از عبور از محدودیت پیام تلگرام
+    if len(text) > 3900:
+        for i in range(0, len(selected), 5):
+            chunk = selected[i:i + 5]
+            out = ""
+
+            for j, config in enumerate(chunk, i + 1):
+                out += f"<b>#{j}</b>\n<code>{config}</code>\n\n"
+
+            await update.message.reply_text(
+                out,
+                parse_mode=ParseMode.HTML
+            )
+    else:
+        await update.message.reply_text(
+            text,
+            parse_mode=ParseMode.HTML
+        )
+
+
+# =========================================================
+# SEND ALL
+# =========================================================
+
+async def send_all(update, context):
+    if not configs:
+        await update.message.reply_text("⏳ لیست کانفیگ خالی است.")
+        return
+
+    data = "\n".join(configs).encode("utf-8")
+
+    bio = io.BytesIO(data)
+    bio.name = "ByteTunnel_all_verified.txt"
+    bio.seek(0)
+
+    await update.message.reply_document(
+        document=bio,
+        caption=(
+            f"📦 <b>ByteTunnel</b>\n\n"
+            f"🟢 تعداد کانفیگ: <b>{len(configs)}</b>"
+        ),
+        parse_mode=ParseMode.HTML
+    )
+
+
+# =========================================================
+# TOP 100
+# =========================================================
+
+async def get_top100():
+    url = RAW_BASE + "top100.txt"
+
+    try:
+        text = await http_get(url)
+        return extract_configs(text)
+    except Exception as e:
+        print("[TOP100 ERROR]", e)
+        return []
+
+
+async def send_top100(update, context):
+    top = await get_top100()
+
+    if not top:
+        await update.message.reply_text(
+            "❌ دریافت Top 100 ناموفق بود."
+        )
+        return
+
+    top = top[:100]
+
+    data = "\n".join(top).encode("utf-8")
+
+    bio = io.BytesIO(data)
+    bio.name = "ByteTunnel_Top100.txt"
+    bio.seek(0)
+
+    await update.message.reply_document(
+        document=bio,
+        caption="🚀 <b>Top 100 ByteTunnel</b>",
+        parse_mode=ParseMode.HTML
+    )
+
+
+# =========================================================
+# STATS
+# =========================================================
+
+async def send_stats(update, context):
+    counts = {}
+
+    for config in configs:
+        p = protocol_of(config)
+        counts[p] = counts.get(p, 0) + 1
+
+    text = (
+        "📊 <b>آمار ByteTunnel</b>\n\n"
+        f"🟢 کل کانفیگ‌ها: <b>{len(configs)}</b>\n"
+        f"👥 کاربران: <b>{user_count()}</b>\n\n"
+        "🔌 <b>پروتکل‌ها:</b>\n"
+    )
+
+    for name, count in sorted(
+        counts.items(),
+        key=lambda x: x[1],
+        reverse=True
+    ):
+        text += f"• {name}: <b>{count}</b>\n"
+
+    if last_update:
+        dt = datetime.fromtimestamp(
+            last_update
+        ).strftime("%Y-%m-%d %H:%M:%S")
+
+        text += f"\n🔄 آخرین آپدیت: <code>{dt}</code>"
+
+    await update.message.reply_text(
+        text,
+        parse_mode=ParseMode.HTML
+    )
+
+
+# =========================================================
+# COUNTRY MENU
+# =========================================================
+
+COUNTRIES = {
+    "🇮🇷 ایران": "Iran",
+    "🇳🇱 هلند": "The_Netherlands",
+    "🇩🇪 آلمان": "Germany",
+    "🇫🇷 فرانسه": "France",
+    "🇬🇧 انگلیس": "United_Kingdom",
+    "🇺🇸 آمریکا": "United_States",
+    "🇨🇦 کانادا": "Canada",
+    "🇹🇷 ترکیه": "Turkey",
+    "🇯🇵 ژاپن": "Japan",
+    "🇸🇬 سنگاپور": "Singapore",
+    "🇮🇹 ایتالیا": "Italy",
+    "🇪🇸 اسپانیا": "Spain",
+    "🇷🇺 روسیه": "Russia",
+    "🇸🇪 سوئد": "Sweden",
+    "🇫🇮 فنلاند": "Finland",
+    "🇵🇱 لهستان": "Poland",
+}
+
+
+async def countries_menu(update, context):
+    buttons = []
+
+    for name in COUNTRIES:
+        buttons.append([
+            InlineKeyboardButton(
+                name,
+                callback_data="country:" + COUNTRIES[name]
+            )
+        ])
+
+    await update.message.reply_text(
+        "🌍 <b>کشور را انتخاب کنید:</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+async def country_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    country = query.data.split(":", 1)[1]
+
+    url = RAW_BASE + f"Countries/{country}.txt"
+
+    try:
+        text = await http_get(url)
+        found = extract_configs(text)
+
+        if not found:
+            await query.message.reply_text(
+                f"❌ برای {country} کانفیگی پیدا نشد."
+            )
+            return
+
+        data = "\n".join(found).encode("utf-8")
+
+        bio = io.BytesIO(data)
+        bio.name = f"ByteTunnel_{country}.txt"
+        bio.seek(0)
+
+        await query.message.reply_document(
+            document=bio,
+            caption=(
+                f"🌍 <b>{country}</b>\n"
+                f"🟢 تعداد: <b>{len(found)}</b>"
+            ),
+            parse_mode=ParseMode.HTML
+        )
+
+    except Exception as e:
+        await query.message.reply_text(
+            f"❌ خطا در دریافت کشور:\n{e}"
+        )
+
+
+# =========================================================
+# PROTOCOL MENU
+# =========================================================
+
+PROTOCOLS = {
+    "VLESS": "vless",
+    "VMess": "vmess",
+    "Trojan": "trojan",
+    "Shadowsocks": "shadowsocks",
+    "Hysteria2": "hysteria2",
+    "TUIC": "tuic",
+}
+
+
+async def protocols_menu(update, context):
+    buttons = [
+        [
+            InlineKeyboardButton(
+                name,
+                callback_data="protocol:" + value
+            )
+        ]
+        for name, value in PROTOCOLS.items()
+    ]
+
+    await update.message.reply_text(
+        "🔌 <b>پروتکل را انتخاب کنید:</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+async def protocol_callback(update, context):
+    query = update.callback_query
+    await query.answer()
+
+    protocol = query.data.split(":", 1)[1]
+
+    url = RAW_BASE + f"protocols/{protocol}.txt"
+
+    try:
+        text = await http_get(url)
+        found = extract_configs(text)
+
+        if not found:
+            await query.message.reply_text(
+                "❌ کانفیگی برای این پروتکل پیدا نشد."
+            )
+            return
+
+        data = "\n".join(found).encode("utf-8")
+
+        bio = io.BytesIO(data)
+        bio.name = f"ByteTunnel_{protocol}.txt"
+        bio.seek(0)
+
+        await query.message.reply_document(
+            document=bio,
+            caption=(
+                f"🔌 <b>{protocol}</b>\n"
+                f"🟢 تعداد: <b>{len(found)}</b>"
+            ),
+            parse_mode=ParseMode.HTML
+        )
+
+    except Exception as e:
+        await query.message.reply_text(
+            f"❌ خطا:\n{e}"
+        )
+
+
+# =========================================================
+# ADMIN PANEL
+# =========================================================
+
+async def admin(update, context):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ دسترسی ندارید.")
+        return
+
+    await update.message.reply_text(
+        "🛠 <b>پنل مدیریت ByteTunnel</b>\n\n"
+        "یک گزینه را انتخاب کنید.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=admin_keyboard()
+    )
+
+
+async def admin_stats(update, context):
+    if not is_admin(update.effective_user.id):
+        return
+
+    proxies = len(get_proxies())
+
+    await update.message.reply_text(
+        "📊 <b>آمار سیستم</b>\n\n"
+        f"🟢 کانفیگ‌ها: <b>{len(configs)}</b>\n"
+        f"👥 کاربران: <b>{user_count()}</b>\n"
+        f"🌐 Proxy فعال: <b>{proxies}</b>\n"
+        f"⏱ آپدیت: <b>{setting('update_interval')} ثانیه</b>\n"
+        f"📦 تعداد ارسال: <b>{setting('amount')}</b>",
+        parse_mode=ParseMode.HTML
+    )
+
+
+async def admin_update(update, context):
+    if not is_admin(update.effective_user.id):
+        return
+
+    await update.message.reply_text("🔄 در حال آپدیت...")
+
+    await update_configs()
+
+    await update.message.reply_text(
+        f"✅ آپدیت انجام شد.\n\n"
+        f"🟢 {len(configs)} کانفیگ موجود است."
+    )
+
+
+async def admin_database(update, context):
+    if not is_admin(update.effective_user.id):
+        return
+
+    await send_all(update, context)
+
+
+# =========================================================
+# PROXY ADMIN
+# =========================================================
+
+async def proxy_menu(update, context):
+    if not is_admin(update.effective_user.id):
+        return
+
+    buttons = [
+        [
+            InlineKeyboardButton(
+                "➕ افزودن Proxy",
+                callback_data="proxy:add"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📋 لیست Proxyها",
+                callback_data="proxy:list"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🧪 تست Proxyها",
+                callback_data="proxy:test"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🗑 حذف همه",
+                callback_data="proxy:clear"
+            )
+        ],
+    ]
+
+    await update.message.reply_text(
+        "🌐 <b>مدیریت Proxy</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+async def proxy_callback(update, context):
+    query = update.callback_query
+
+    if not is_admin(query.from_user.id):
+        await query.answer("⛔ دسترسی ندارید.", show_alert=True)
+        return
+
+    await query.answer()
+
+    action = query.data.split(":", 1)[1]
+
+    if action == "add":
+        context.user_data["waiting_proxy"] = True
+
+        await query.message.reply_text(
+            "➕ Proxy را در پیام بعدی ارسال کن.\n\n"
+            "مثال:\n"
+            "<code>http://127.0.0.1:8080</code>\n\n"
+            "یا:\n"
+            "<code>socks5://127.0.0.1:1080</code>",
+            parse_mode=ParseMode.HTML
+        )
+
+    elif action == "list":
+        proxies = get_proxies()
+
+        if not proxies:
+            await query.message.reply_text(
+                "📋 هیچ Proxy فعالی ثبت نشده."
+            )
+            return
+
+        text = "🌐 <b>Proxyهای فعال:</b>\n\n"
+
+        buttons = []
+
+        for p in proxies:
+            text += f"#{p['id']} — <code>{p['proxy']}</code>\n"
+
+            buttons.append([
+                InlineKeyboardButton(
+                    f"🗑 حذف #{p['id']}",
+                    callback_data=f"proxydelete:{p['id']}"
+                )
+            ])
+
+        await query.message.reply_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+
+    elif action == "clear":
+        clear_proxies()
+
+        await query.message.reply_text(
+            "🗑 همه Proxyها حذف شدند."
+        )
+
+    elif action == "test":
+        proxies = get_proxies()
+
+        if not proxies:
+            await query.message.reply_text(
+                "❌ Proxy فعالی وجود ندارد."
+            )
+            return
+
+        msg = await query.message.reply_text(
+            "🧪 تست Proxyها شروع شد..."
+        )
+
+        results = []
+
+        for p in proxies:
+            proxy = p["proxy"]
+
+            try:
+                start = time.perf_counter()
+
+                async with httpx.AsyncClient(
+                    proxy=proxy,
+                    timeout=10
+                ) as client:
+                    r = await client.get(
+                        "https://api.github.com"
+                    )
+
+                ms = int(
+                    (time.perf_counter() - start) * 1000
+                )
+
+                results.append(
+                    f"🟢 #{p['id']} — {ms}ms"
+                )
+
+            except Exception:
+                results.append(
+                    f"🔴 #{p['id']} — FAIL"
+                )
+
+        await msg.edit_text(
+            "🧪 <b>نتیجه تست Proxy</b>\n\n" +
+            "\n".join(results),
+            parse_mode=ParseMode.HTML
+        )
+
+
+async def proxy_delete_callback(update, context):
+    query = update.callback_query
+
+    if not is_admin(query.from_user.id):
+        await query.answer("⛔", show_alert=True)
+        return
+
+    await query.answer()
+
+    proxy_id = int(query.data.split(":", 1)[1])
+
+    if delete_proxy(proxy_id):
+        await query.message.reply_text(
+            f"✅ Proxy #{proxy_id} حذف شد."
+        )
+    else:
+        await query.message.reply_text(
+            "❌ Proxy پیدا نشد."
+        )
+
+
+# =========================================================
+# SETTINGS
+# =========================================================
+
+async def settings_menu(update, context):
+    if not is_admin(update.effective_user.id):
+        return
+
+    await update.message.reply_text(
+        "⚙️ <b>تنظیمات فعلی</b>\n\n"
+        f"⏱ فاصله آپدیت: <b>{setting('update_interval')}</b> ثانیه\n"
+        f"📦 تعداد کانفیگ هر بار: <b>{setting('amount')}</b>\n\n"
+        "برای تغییر:\n"
+        "<code>/setinterval 900</code>\n"
+        "<code>/setamount 10</code>",
+        parse_mode=ParseMode.HTML
+    )
+
+
+async def set_interval(update, context):
+    if not is_admin(update.effective_user.id):
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "مثال: /setinterval 600"
+        )
+        return
+
+    try:
+        value = int(context.args[0])
+        value = max(60, value)
+
+        set_setting("update_interval", value)
+
+        await update.message.reply_text(
+            f"✅ فاصله آپدیت روی {value} ثانیه تنظیم شد."
+        )
+
+    except ValueError:
+        await update.message.reply_text(
+            "❌ عدد وارد کن."
+        )
+
+
+async def set_amount(update, context):
+    if not is_admin(update.effective_user.id):
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "مثال: /setamount 10"
+        )
+        return
+
+    try:
+        value = int(context.args[0])
+        value = max(1, min(value, 50))
+
+        set_setting("amount", value)
+
+        await update.message.reply_text(
+            f"✅ تعداد ارسال روی {value} تنظیم شد."
+        )
+
+    except ValueError:
+        await update.message.reply_text(
+            "❌ عدد وارد کن."
+        )
+
+
+# =========================================================
+# BROADCAST
+# =========================================================
+
+async def broadcast_command(update, context):
+    if not is_admin(update.effective_user.id):
+        return
+
+    context.user_data["broadcast"] = True
+
+    await update.message.reply_text(
+        "📢 متن پیام همگانی را در پیام بعدی ارسال کن."
+    )
+
+
+async def handle_admin_text(update, context):
+    if not is_admin(update.effective_user.id):
+        return False
+
+    text = update.message.text
+
+    # Proxy add
+    if context.user_data.get("waiting_proxy"):
+        proxy = text.strip()
+
+        if not re.match(
+            r"^(https?|socks5|socks5h)://",
+            proxy,
+            re.IGNORECASE
+        ):
+            await update.message.reply_text(
+                "❌ فرمت Proxy معتبر نیست."
+            )
+            return True
+
+        if add_proxy(proxy):
+            await update.message.reply_text(
+                "✅ Proxy با موفقیت اضافه شد."
+            )
+        else:
+            await update.message.reply_text(
+                "⚠️ این Proxy قبلاً ثبت شده."
+            )
+
+        context.user_data["waiting_proxy"] = False
+        return True
+
+    # Broadcast
+    if context.user_data.get("broadcast"):
+        context.user_data["broadcast"] = False
+
+        conn = db()
+        users = conn.execute(
+            "SELECT user_id FROM users"
+        ).fetchall()
+        conn.close()
+
+        sent = 0
+        failed = 0
+
+        await update.message.reply_text(
+            f"📢 ارسال برای {len(users)} کاربر شروع شد..."
+        )
+
+        for row in users:
+            try:
+                await context.bot.send_message(
+                    chat_id=row["user_id"],
+                    text=text
+                )
+                sent += 1
+                await asyncio.sleep(0.05)
+            except Exception:
+                failed += 1
+
+        await update.message.reply_text(
+            f"✅ Broadcast تمام شد.\n\n"
+            f"🟢 موفق: {sent}\n"
+            f"🔴 ناموفق: {failed}"
+        )
+
+        return True
+
+    return False
+
+
+# =========================================================
+# MESSAGE ROUTER
+# =========================================================
+
+async def message_router(update, context):
+    save_user(update.effective_user)
+
+    if await handle_admin_text(update, context):
+        return
+
+    text = update.message.text
+
+    if text == "⚡ دریافت کانفیگ":
+        await send_random_configs(update, context)
+
+    elif text == "📦 دریافت همه":
+        await send_all(update, context)
+
+    elif text == "🚀 بهترین 100":
+        await send_top100(update, context)
+
+    elif text == "🌍 کشورها":
+        await countries_menu(update, context)
+
+    elif text == "🔌 پروتکل‌ها":
+        await protocols_menu(update, context)
+
+    elif text == "📊 آمار":
+        await send_stats(update, context)
+
+    elif text == "🏠 منوی کاربر":
+        await update.message.reply_text(
+            "🏠 منوی کاربر",
+            reply_markup=main_keyboard()
+        )
+
+    elif text == "📊 آمار سیستم" and is_admin(update.effective_user.id):
+        await admin_stats(update, context)
+
+    elif text == "🔄 آپدیت دستی" and is_admin(update.effective_user.id):
+        await admin_update(update, context)
+
+    elif text == "📦 دریافت دیتابیس" and is_admin(update.effective_user.id):
+        await admin_database(update, context)
+
+    elif text == "🚀 Top 100" and is_admin(update.effective_user.id):
+        await send_top100(update, context)
+
+    elif text == "🌍 کشورها" and is_admin(update.effective_user.id):
+        await countries_menu(update, context)
+
+    elif text == "🔌 پروتکل‌ها" and is_admin(update.effective_user.id):
+        await protocols_menu(update, context)
+
+    elif text == "🌐 مدیریت Proxy" and is_admin(update.effective_user.id):
+        await proxy_menu(update, context)
+
+    elif text == "⚙️ تنظیمات" and is_admin(update.effective_user.id):
+        await settings_menu(update, context)
+
+    elif text == "📢 ارسال همگانی" and is_admin(update.effective_user.id):
+        await broadcast_command(update, context)
+
+
+# =========================================================
+# AUTO UPDATE
+# =========================================================
+
+async def auto_update():
+    while True:
+        interval = int(
+            setting(
+                "update_interval",
+                DEFAULT_INTERVAL
+            )
+        )
+
+        await asyncio.sleep(interval)
+
+        try:
+            await update_configs()
+        except Exception as e:
+            print("[AUTO UPDATE ERROR]", e)
+
+
+async def post_init(application):
+    init_db()
+    await update_configs()
+    application.bot_data["auto_update_task"] = asyncio.create_task(auto_update())
+
+
+
+# =========================================================
+# ERROR
+# =========================================================
+
+async def error_handler(update, context):
+    print("[BOT ERROR]", context.error)
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+def main():
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
+
+    application.add_handler(
+        CommandHandler("start", start)
+    )
+
+    application.add_handler(
+        CommandHandler("admin", admin)
+    )
+
+    application.add_handler(
+        CommandHandler("configs", send_random_configs)
+    )
+
+    application.add_handler(
+        CommandHandler("stats", send_stats)
+    )
+
+    application.add_handler(
+        CommandHandler("setinterval", set_interval)
+    )
+
+    application.add_handler(
+        CommandHandler("setamount", set_amount)
+    )
+
+    application.add_handler(
+        CommandHandler("broadcast", broadcast_command)
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            country_callback,
+            pattern=r"^country:"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            protocol_callback,
+            pattern=r"^protocol:"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            proxy_callback,
+            pattern=r"^proxy:"
+        )
+    )
+
+    application.add_handler(
+        CallbackQueryHandler(
+            proxy_delete_callback,
+            pattern=r"^proxydelete:"
+        )
+    )
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            message_router
+        )
+    )
+
+    application.add_error_handler(error_handler)
+
+    print("ByteTunnelBot started...")
+    print("Admin IDs:", ADMIN_IDS)
+
+    application.run_polling(
+        allowed_updates=Update.ALL_TYPES
+    )
+
+
+if __name__ == "__main__":
+    main()
