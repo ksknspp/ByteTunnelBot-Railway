@@ -33,7 +33,7 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "8394607974"))
 CHANNEL = "@ByteTunnel"
 
 SCRIPT = Path(__file__).with_name("bytetunnel.sh")
-DB_FILE = Path(os.getenv("DB_FILE", str(Path(__file__).with_name("bytetunnel_bot.db")))
+DB_FILE = Path(os.getenv("DB_FILE", str(Path(__file__).with_name("bytetunnel_bot.db"))))
 
 CF_SIGNUP = "https://dash.cloudflare.com/sign-up"
 
