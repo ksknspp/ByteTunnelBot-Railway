@@ -244,9 +244,20 @@ SUBDOMAIN=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/$ACCOU
   -H "Authorization: Bearer $API_TOKEN" | jq -r '.result.subdomain // empty')
 
 if [ -z "$SUBDOMAIN" ] || [ "$SUBDOMAIN" = "null" ]; then
-  echo "خطا: workers.dev subdomain برای این اکانت فعال نیست."
-  echo "از Cloudflare Dashboard بخش Workers & Pages یک بار Workers را باز و فعال کنید."
-  exit 1
+  SUBDOMAIN="bt$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+
+  CREATE_SUBDOMAIN=$(curl -s -X PUT "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/workers/subdomain" \
+    -H "Authorization: Bearer $API_TOKEN" \
+    -H "Content-Type: application/json" \
+    --data "{\"subdomain\":\"$SUBDOMAIN\"}")
+
+  SUBDOMAIN=$(echo "$CREATE_SUBDOMAIN" | jq -r '.result.subdomain // empty')
+
+  if [ -z "$SUBDOMAIN" ] || [ "$SUBDOMAIN" = "null" ]; then
+    echo "خطا در ساخت workers.dev subdomain:"
+    echo "$CREATE_SUBDOMAIN" | jq .
+    exit 1
+  fi
 fi
 
 echo
