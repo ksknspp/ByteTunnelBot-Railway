@@ -241,7 +241,13 @@ curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/worke
   -H "Authorization: Bearer $API_TOKEN" -H "Content-Type: application/json" \
   --data '{"enabled":true}' > /dev/null
 SUBDOMAIN=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/workers/subdomain" \
-  -H "Authorization: Bearer $API_TOKEN" | jq -r '.result.subdomain')
+  -H "Authorization: Bearer $API_TOKEN" | jq -r '.result.subdomain // empty')
+
+if [ -z "$SUBDOMAIN" ] || [ "$SUBDOMAIN" = "null" ]; then
+  echo "خطا: workers.dev subdomain برای این اکانت فعال نیست."
+  echo "از Cloudflare Dashboard بخش Workers & Pages یک بار Workers را باز و فعال کنید."
+  exit 1
+fi
 
 echo
 echo "======================================"
