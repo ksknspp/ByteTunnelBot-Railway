@@ -16,3 +16,10 @@ bot.py.broken
 *.sqlite3
 data/*.db
 backups/
+
+.env
+*.db
+*.sqlite
+*.sqlite3
+__pycache__/
+*.pyc

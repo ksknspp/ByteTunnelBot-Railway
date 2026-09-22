@@ -17,8 +17,8 @@ ACCOUNT_ID=$(echo "$ACCOUNTS" | jq -r '.result[0].id')
 if [ -z "$ACCOUNT_ID" ] || [ "$ACCOUNT_ID" = "null" ]; then echo "خطا در Account ID"; echo "$ACCOUNTS" | jq .; exit 1; fi
 echo "✓ Worker: $WORKER_NAME"
 
-curl -sL https://raw.githubusercontent.com/netrair/Apex/main/worker.js -o worker.js
-curl -sL https://raw.githubusercontent.com/netrair/Apex/main/schema.sql -o schema.sql
+cp worker.local.js worker.js
+cp schema.local.sql schema.sql
 echo "اعمال چیدمان جدید..."
 
 python3 << 'PY'
