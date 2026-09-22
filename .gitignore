@@ -4,3 +4,15 @@ __pycache__/
 bytetunnel_bot.db
 backups/
 *.bak
+
+# Old backups / databases
+bot.py.*
+bot.py.backup*
+bot.py.bak*
+bot.py.before_*
+bot.py.broken
+*.db
+*.sqlite
+*.sqlite3
+data/*.db
+backups/
